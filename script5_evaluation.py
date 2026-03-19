@@ -51,43 +51,42 @@ RESULTS_DIR  = "results"
 
 SEQ_LEN      = 60
 BATCH_SIZE   = 1024
-NUM_WORKERS  = 0
+NUM_WORKERS  = 4
 CLASS_NAMES  = ["Buy", "Hold", "Sell"]
 N_CLASSES    = 3
 
 
-# ── Dataset (copied from script 4 for self-containment) ──────────────────────
+# ── Dataset (pre-materialised windows — mirrors script 4) ────────────────────
 class StockDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: str, seq_len: int = SEQ_LEN):
-        self.seq_len = seq_len
-        self.ticker_returns: list[np.ndarray] = []
-        self.ticker_labels:  list[np.ndarray] = []
-        idx_list: list[tuple[int, int]] = []
-
         files = sorted(glob(os.path.join(data_dir, "*.npz")))
         if not files:
             raise FileNotFoundError(f"No .npz files in {data_dir}")
 
-        for t_idx, fpath in enumerate(files):
+        all_x: list[np.ndarray] = []
+        all_y: list[np.ndarray] = []
+
+        for fpath in files:
             data = np.load(fpath)
             ret  = data["normalized_return"].astype(np.float32)
             lbl  = data["label"].astype(np.int64)
-            self.ticker_returns.append(ret)
-            self.ticker_labels.append(lbl)
-            for pos in range(seq_len, len(ret)):
-                idx_list.append((t_idx, pos))
+            n    = len(ret)
 
-        self.indices = np.array(idx_list, dtype=np.int32)
+            shape   = (n - seq_len, seq_len)
+            strides = (ret.strides[0], ret.strides[0])
+            windows = np.lib.stride_tricks.as_strided(ret, shape=shape, strides=strides)
+            all_x.append(np.array(windows, copy=True))
+            all_y.append(lbl[seq_len:])
+
+        self.x = np.concatenate(all_x, axis=0)
+        self.y = np.concatenate(all_y, axis=0)
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.x)
 
     def __getitem__(self, idx: int):
-        t_idx, pos = int(self.indices[idx, 0]), int(self.indices[idx, 1])
-        ret = self.ticker_returns[t_idx]
-        x   = ret[pos - self.seq_len : pos]
-        y   = self.ticker_labels[t_idx][pos]
-        return torch.from_numpy(x).unsqueeze(-1), torch.tensor(y, dtype=torch.long)
+        return (torch.from_numpy(self.x[idx]).unsqueeze(-1),
+                torch.tensor(self.y[idx], dtype=torch.long))
 
 
 # ── Model (identical to script 4) ────────────────────────────────────────────
@@ -195,6 +194,7 @@ def main():
     ckpt_path = os.path.join(MODELS_DIR, "best_model.pth")
     ckpt      = torch.load(ckpt_path, map_location=device)
     cfg       = ckpt["config"]
+    seq_len   = cfg.pop("seq_len", SEQ_LEN)
     print(f"Loaded checkpoint from epoch {ckpt['epoch']} "
           f"(val_loss={ckpt['val_loss']:.4f})")
 
@@ -205,9 +205,13 @@ def main():
     # ── Load test dataset ─────────────────────────────────────────────────────
     print("\nLoading test dataset …")
     test_ds     = StockDataset(os.path.join(DATASETS_DIR, "test"),
-                               seq_len=cfg["seq_len"])
+                               seq_len=seq_len)
+    pin = device.type == "cuda"
+    persistent = NUM_WORKERS > 0
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE,
-                             shuffle=False, num_workers=NUM_WORKERS)
+                             shuffle=False, num_workers=NUM_WORKERS,
+                             pin_memory=pin, persistent_workers=persistent,
+                             prefetch_factor=2 if persistent else None)
     print(f"  {len(test_ds):,} test samples")
 
     # ── Inference ─────────────────────────────────────────────────────────────

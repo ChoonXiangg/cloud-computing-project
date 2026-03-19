@@ -59,62 +59,60 @@ LR_PATIENCE  = 3
 LR_FACTOR    = 0.5
 ES_PATIENCE  = 7    # early-stopping patience (epochs)
 
-NUM_WORKERS  = 0    # set >0 on Linux for faster data loading
+NUM_WORKERS  = 4    # >0 enables parallel data loading (works on Windows too)
 SEED         = 42
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class StockDataset(Dataset):
     """
-    Loads all per-ticker .npz files for a split into RAM.
-    Each __getitem__ call slices a SEQ_LEN window ending at `position`
-    and returns (x, y) where x shape = (SEQ_LEN, 1).
+    Loads all per-ticker .npz files for a split into RAM and pre-materialises
+    every SEQ_LEN window up-front into a single contiguous float32 array.
 
-    Valid positions satisfy:
-      - position >= SEQ_LEN          (enough history)
-      - label[position] in {0,1,2}   (already guaranteed by script 3,
-                                      which dropped label == -1 rows)
+    Pre-materialisation trades a one-time memory cost for much faster
+    __getitem__ calls (simple index into a numpy array vs. Python slice +
+    tensor construction on every call).
+
+    Memory estimate: N_samples * SEQ_LEN * 4 bytes
+      e.g. 1 M samples → ~229 MB — well within typical RAM budgets.
     """
 
     def __init__(self, data_dir: str, seq_len: int = SEQ_LEN):
-        self.seq_len = seq_len
-        self.ticker_returns: list[np.ndarray] = []
-        self.ticker_labels:  list[np.ndarray] = []
-
-        # indices[k] = (ticker_idx, position) stored as int32 pair
-        idx_list: list[tuple[int, int]] = []
-
         files = sorted(glob(os.path.join(data_dir, "*.npz")))
         if not files:
             raise FileNotFoundError(f"No .npz files in {data_dir}")
 
-        for t_idx, fpath in enumerate(files):
-            data     = np.load(fpath)
-            ret      = data["normalized_return"].astype(np.float32)
-            lbl      = data["label"].astype(np.int64)
-            n        = len(ret)
+        all_x: list[np.ndarray] = []
+        all_y: list[np.ndarray] = []
 
-            self.ticker_returns.append(ret)
-            self.ticker_labels.append(lbl)
+        for fpath in files:
+            data = np.load(fpath)
+            ret  = data["normalized_return"].astype(np.float32)  # (T,)
+            lbl  = data["label"].astype(np.int64)                # (T,)
+            n    = len(ret)
 
-            # All positions >= seq_len are valid (label == -1 already removed)
-            for pos in range(seq_len, n):
-                idx_list.append((t_idx, pos))
+            # Build (n - seq_len) windows using a strided view — no copy yet
+            # shape: (n - seq_len, seq_len)
+            shape   = (n - seq_len, seq_len)
+            strides = (ret.strides[0], ret.strides[0])
+            windows = np.lib.stride_tricks.as_strided(ret, shape=shape, strides=strides)
+            all_x.append(np.array(windows, copy=True))   # materialise
+            all_y.append(lbl[seq_len:])                  # aligned labels
 
-        # Store as contiguous int32 array  shape (N, 2)
-        self.indices = np.array(idx_list, dtype=np.int32)
-        print(f"  Loaded {len(files)} tickers, {len(self.indices):,} samples.")
+        # Single contiguous arrays — (N, SEQ_LEN) and (N,)
+        self.x = np.concatenate(all_x, axis=0)   # float32
+        self.y = np.concatenate(all_y, axis=0)   # int64
+        print(f"  Loaded {len(files)} tickers, {len(self.x):,} samples "
+              f"(x: {self.x.nbytes / 1e6:.0f} MB).")
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.x)
 
     def __getitem__(self, idx: int):
-        t_idx, pos = int(self.indices[idx, 0]), int(self.indices[idx, 1])
-        ret = self.ticker_returns[t_idx]
-        x   = ret[pos - self.seq_len : pos]          # (SEQ_LEN,)
-        y   = self.ticker_labels[t_idx][pos]
-        # x shape → (SEQ_LEN, 1) for LSTM
-        return torch.from_numpy(x).unsqueeze(-1), torch.tensor(y, dtype=torch.long)
+        # Direct array index — no slicing, no tensor construction overhead
+        x = torch.from_numpy(self.x[idx]).unsqueeze(-1)  # (SEQ_LEN, 1)
+        y = torch.tensor(self.y[idx], dtype=torch.long)
+        return x, y
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -152,27 +150,46 @@ class LSTMClassifier(nn.Module):
 
 
 # ── Training utilities ────────────────────────────────────────────────────────
-def run_epoch(model, loader, criterion, optimizer, device, train: bool):
+def run_epoch(model, loader, criterion, optimizer, device, train: bool,
+              scaler: "torch.amp.GradScaler | None" = None):
     model.train(train)
     total_loss = 0.0
     correct    = 0
     total      = 0
+    n_batches  = len(loader)
+    tag        = "Train" if train else "Val"
+    use_amp    = scaler is not None and device.type == "cuda"
 
     with torch.set_grad_enabled(train):
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss   = criterion(logits, y)
+        for i, (x, y) in enumerate(loader, 1):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             if train:
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(x)
+                loss   = criterion(logits, y)
+
+            if train:
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
 
             total_loss += loss.item() * len(y)
             correct    += (logits.argmax(dim=1) == y).sum().item()
             total      += len(y)
+
+            if i % 500 == 0 or i == n_batches:
+                print(f"  {tag} batch {i:,}/{n_batches:,} "
+                      f"({100*i/n_batches:.0f}%)", flush=True)
 
     return total_loss / total, correct / total
 
@@ -200,12 +217,16 @@ def main():
     print("Loading validation dataset …")
     val_ds   = StockDataset(os.path.join(DATASETS_DIR, "val"))
 
+    pin = device.type == "cuda"
+    persistent = NUM_WORKERS > 0
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
                               shuffle=True,  num_workers=NUM_WORKERS,
-                              pin_memory=(device.type == "cuda"))
+                              pin_memory=pin, persistent_workers=persistent,
+                              prefetch_factor=2 if persistent else None)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2,
                               shuffle=False, num_workers=NUM_WORKERS,
-                              pin_memory=(device.type == "cuda"))
+                              pin_memory=pin, persistent_workers=persistent,
+                              prefetch_factor=2 if persistent else None)
 
     # ── Model / optimiser / scheduler ────────────────────────────────────────
     model     = LSTMClassifier().to(device)
@@ -213,8 +234,10 @@ def main():
                                   weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=LR_FACTOR,
-        patience=LR_PATIENCE, verbose=True)
+        patience=LR_PATIENCE)
     criterion = nn.CrossEntropyLoss(weight=cw)
+    # Mixed-precision scaler — active only on CUDA; no-op on CPU
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {n_params:,}")
@@ -232,9 +255,11 @@ def main():
         t0 = time.time()
 
         train_loss, train_acc = run_epoch(
-            model, train_loader, criterion, optimizer, device, train=True)
+            model, train_loader, criterion, optimizer, device, train=True,
+            scaler=scaler)
         val_loss, val_acc = run_epoch(
-            model, val_loader, criterion, optimizer, device, train=False)
+            model, val_loader, criterion, optimizer, device, train=False,
+            scaler=None)
 
         scheduler.step(val_loss)
         elapsed = time.time() - t0
